@@ -1,0 +1,220 @@
+; ==================================================================
+; vga_image.lasys - Driver VGA y Visualizador BMP para LuisAlbertoOS
+; ==================================================================
+
+%ifndef VGA_IMAGE_LASYS
+%define VGA_IMAGE_LASYS
+
+VGA_VRAM    equ 0xA0000
+BMP_LOAD_AD equ 0x7000  ; Definido como APP_POINTER en fs.lasys
+
+vga_image_view:
+    ; 1. Cambiar a Modo Gráfico 13h (320x200x256) programando puertos VGA
+    mov esi, vga_regs_13h
+    call vga_write_regs
+
+    ; 2. Limpiar la pantalla (VRAM a 0)
+    mov edi, VGA_VRAM
+    mov ecx, 320 * 200 / 4
+    xor eax, eax
+    rep stosd
+
+    ; 3. Analizar y dibujar el archivo BMP
+    call draw_bmp
+
+    ; 4. Bucle de bloqueo: Esperar tecla ESC (Scan code 0x01)
+.wait_esc:
+    in al, 0x60
+    cmp al, 0x01        ; 0x01 es el código de presión de ESC
+    jne .wait_esc
+
+    ; Esperar a que se suelte la tecla para no inyectar basura al shell
+.wait_release:
+    in al, 0x60
+    test al, 0x80       ; El bit superior indica que se soltó la tecla
+    jz .wait_release
+
+    ; 5. Restaurar Modo Texto 3h (80x25) para devolver el control al shell
+    mov esi, vga_regs_3h
+    call vga_write_regs
+
+    ret
+
+; ==================================================================
+; RENDERIZADOR DE BMP
+; ==================================================================
+draw_bmp:
+    mov esi, BMP_LOAD_AD
+
+    ; Verificar la firma 'BM' (0x4D42)
+    cmp word [esi], 0x4D42
+    jne .end
+
+    ; Extraer propiedades del BMP
+    mov ebx, [esi + 0x0A] ; Offset donde inician los píxeles
+    add ebx, BMP_LOAD_AD  ; Dirección física de los píxeles
+    
+    mov ecx, [esi + 0x12] ; Ancho
+    mov edx, [esi + 0x16] ; Alto
+
+    ; Limitar dimensiones a 320x200 para evitar desbordar la VRAM
+    cmp ecx, 320
+    jle .width_ok
+    mov ecx, 320
+.width_ok:
+    cmp edx, 200
+    jle .height_ok
+    mov edx, 200
+.height_ok:
+
+    ; Cargar la paleta de colores del BMP (empieza en el offset 54 / 0x36)
+    pushad
+    mov esi, BMP_LOAD_AD
+    add esi, 54
+    mov dx, 0x3C8
+    mov al, 0
+    out dx, al            ; Iniciar DAC en índice 0
+    mov dx, 0x3C9
+    mov ecx, 256          ; 256 colores a cargar
+.load_palette:
+    ; Los BMP guardan la paleta en formato B-G-R. 
+    ; VGA usa formato R-G-B en rango de 6 bits (0-63), por lo que dividimos entre 4 (shr 2)
+    mov bl, [esi + 2]     ; Rojo
+    shr bl, 2
+    mov al, bl
+    out dx, al
+
+    mov bl, [esi + 1]     ; Verde
+    shr bl, 2
+    mov al, bl
+    out dx, al
+
+    mov bl, [esi + 0]     ; Azul
+    shr bl, 2
+    mov al, bl
+    out dx, al
+
+    add esi, 4            ; Avanzar 4 bytes (B, G, R, Reservado)
+    dec ecx
+    jnz .load_palette
+    popad
+
+    ; Dibujar píxeles: Los BMP se almacenan de ABAJO hacia ARRIBA
+    mov edi, VGA_VRAM
+    ; Calcular inicio de la última fila: (Alto - 1) * 320
+    mov eax, edx
+    dec eax
+    imul eax, 320
+    add edi, eax          ; EDI = Dirección del primer píxel de la última fila
+
+    mov esi, ebx          ; ESI = Puntero a la data de píxeles
+
+.draw_row:
+    push ecx              ; Guardar Ancho
+    push edi              ; Guardar posición de pantalla actual
+
+    rep movsb             ; Copiar fila completa
+
+    pop edi
+    pop ecx
+
+    sub edi, 320          ; Subir una fila en la pantalla
+    dec edx
+    jnz .draw_row         ; Repetir hasta completar el Alto
+
+.end:
+    ret
+
+; ==================================================================
+; PROGRAMACIÓN DE PUERTOS VGA (MODO PROTEGIDO)
+; ==================================================================
+vga_write_regs:
+    ; ESI debe apuntar al array de registros deseado
+    mov dx, 0x3C2       ; Misc Output Register
+    lodsb
+    out dx, al
+
+    mov ecx, 5          ; Sequencer Registers
+    mov ah, 0
+.seq_loop:
+    mov dx, 0x3C4
+    mov al, ah
+    out dx, al
+    inc dx
+    lodsb
+    out dx, al
+    inc ah
+    loop .seq_loop
+
+    mov dx, 0x3D4       ; Desbloquear CRTC
+    mov al, 0x11
+    out dx, al
+    inc dx
+    in al, dx
+    and al, 0x7F
+    out dx, al
+    dec dx
+
+    mov ecx, 25         ; CRTC Registers
+    mov ah, 0
+.crtc_loop:
+    mov dx, 0x3D4
+    mov al, ah
+    out dx, al
+    inc dx
+    lodsb
+    out dx, al
+    inc ah
+    loop .crtc_loop
+
+    mov ecx, 9          ; Graphics Controller Registers
+    mov ah, 0
+.gc_loop:
+    mov dx, 0x3CE
+    mov al, ah
+    out dx, al
+    inc dx
+    lodsb
+    out dx, al
+    inc ah
+    loop .gc_loop
+
+    mov ecx, 21         ; Attribute Controller Registers
+    mov ah, 0
+.ac_loop:
+    mov dx, 0x3DA
+    in al, dx           ; Reset flip-flop
+    mov dx, 0x3C0
+    mov al, ah
+    out dx, al
+    lodsb
+    out dx, al
+    inc ah
+    loop .ac_loop
+
+    mov dx, 0x3DA       ; Reactivar pantalla en Attribute Controller
+    in al, dx
+    mov dx, 0x3C0
+    mov al, 0x20
+    out dx, al
+    ret
+
+; ==================================================================
+; TABLAS DE REGISTROS MÁGICOS (VALORES ESTÁNDAR IBM VGA)
+; ==================================================================
+
+vga_regs_13h:
+    db 0x63 ; MISC
+    db 0x03, 0x01, 0x0F, 0x00, 0x0E ; SEQ
+    db 0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9C, 0x8E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3, 0xFF ; CRTC
+    db 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0F, 0xFF ; GC
+    db 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x41, 0x00, 0x0F, 0x00, 0x00 ; AC
+
+vga_regs_3h:
+    db 0x67 ; MISC
+    db 0x03, 0x00, 0x03, 0x00, 0x02 ; SEQ
+    db 0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F, 0x00, 0x4F, 0x0D, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x9C, 0x8E, 0x8F, 0x28, 0x0F, 0x96, 0xB9, 0xA3, 0xFF ; CRTC
+    db 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF ; GC
+    db 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x0C, 0x00, 0x0F, 0x08, 0x00 ; AC
+
+%endif

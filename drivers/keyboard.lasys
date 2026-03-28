@@ -1,0 +1,183 @@
+%ifndef KEYBOARD_LASYS
+%define KEYBOARD_LASYS
+
+global kbd_read_char
+
+; -----------------------------
+; Estado
+; -----------------------------
+ctrl_state db 0
+shift_state db 0
+
+; -----------------------------
+; Leer carácter (bloqueante)
+; Devuelve:
+;   AL = ASCII (0 si ignorar)
+; -----------------------------
+kbd_read_char:
+
+.wait:
+    in al, 0x64
+    test al, 1
+    jz .wait
+
+    in al, 0x60
+    mov bl, al
+
+    ; -------------------------
+    ; Detectar release (bit 7)
+    ; -------------------------
+    test bl, 0x80
+    jnz .key_release
+
+    ; -------------------------
+    ; CTRL
+    ; -------------------------
+    cmp bl, 0x1D
+    je .set_ctrl
+
+    ; -------------------------
+    ; SHIFT
+    ; -------------------------
+    cmp bl, 0x2A        ; Left Shift
+    je .set_shift
+    cmp bl, 0x36        ; Right Shift
+    je .set_shift
+
+    ; -------------------------
+    ; ESC
+    ; -------------------------
+    cmp bl, 0x01        ; Scancode para ESC
+    je .ret_esc
+
+    ; -------------------------
+    ; ENTER
+    ; -------------------------
+    cmp bl, 0x1C
+    je .ret_enter
+
+    ; -------------------------
+    ; BACKSPACE
+    ; -------------------------
+    cmp bl, 0x0E
+    je .ret_backspace
+
+    ; -------------------------
+    ; SPACE
+    ; -------------------------
+    cmp bl, 0x39
+    je .ret_space
+
+    ; -------------------------
+    ; CTRL combos
+    ; -------------------------
+    cmp byte [ctrl_state], 1
+    jne .normal_key
+
+    cmp bl, 0x2E        ; C
+    je .ctrl_c
+    cmp bl, 0x2D        ; X
+    je .ctrl_x
+
+.normal_key:
+    movzx eax, bl
+    cmp eax, 58
+    jae .ignore
+
+    cmp byte [shift_state], 1
+    je .use_shift
+
+    mov al, [scancode_map + eax]
+    ret
+
+.use_shift:
+    mov al, [scancode_shift_map + eax]
+    ret
+
+; -----------------------------
+; Key release handling
+; -----------------------------
+.key_release:
+    and bl, 0x7F
+
+    cmp bl, 0x1D
+    je .clr_ctrl
+
+    cmp bl, 0x2A
+    je .clr_shift
+    cmp bl, 0x36
+    je .clr_shift
+
+    jmp .ignore
+
+; -----------------------------
+; States
+; -----------------------------
+.set_ctrl:
+    mov byte [ctrl_state], 1
+    jmp .ignore
+
+.clr_ctrl:
+    mov byte [ctrl_state], 0
+    jmp .ignore
+
+.set_shift:
+    mov byte [shift_state], 1
+    jmp .ignore
+
+.clr_shift:
+    mov byte [shift_state], 0
+    jmp .ignore
+
+; -----------------------------
+; Special keys
+; -----------------------------
+.ret_esc:
+    mov al, 0x1B        ; Código ASCII para ESC
+    ret
+
+.ret_enter:
+    mov al, 0x0A
+    ret
+
+.ret_backspace:
+    mov al, 0x08
+    ret
+
+.ret_space:
+    mov al, ' '
+    ret
+
+.ctrl_c:
+    mov al, 0x03
+    ret
+
+.ctrl_x:
+    mov al, 0x18
+    ret
+
+.ignore:
+    mov al, 0
+    ret
+
+; -----------------------------
+; SCANCODE MAP (normal)
+; -----------------------------
+scancode_map:
+    db 0,0,'1','2','3','4','5','6','7','8','9','0','-','=',0,0
+    db 'q','w','e','r','t','y','u','i','o','p','[',']',0,0
+    db 'a','s','d','f','g','h','j','k','l',';',39,'`',0
+    db '\','z','x','c','v','b','n','m',',','.','/',0
+    db '*',0,' '
+
+; -----------------------------
+; SCANCODE MAP (SHIFT)
+; -----------------------------
+scancode_shift_map:
+    db 0,0,'!','@','#','$','%','^','&','*','(',')','_','+',0,0
+    db 'Q','W','E','R','T','Y','U','I','O','P','{','}',0,0
+    db 'A','S','D','F','G','H','J','K','L',':','"', '~',0
+    db '|','Z','X','C','V','B','N','M','<','>','?',0
+    db '*',0,' '
+
+%endif

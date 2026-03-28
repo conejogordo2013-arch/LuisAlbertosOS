@@ -1,0 +1,132 @@
+; ------------------------------------------------------------------
+; floppy.lasys - Minimal LBA28 ATA PIO Block Driver
+; ------------------------------------------------------------------
+
+%ifndef ATA_LASYS
+%define ATA_LASYS
+
+global floppy_read_sector
+global floppy_write_sector
+
+msg_floppy_err db "ATA read/write error", 0x0A, 0
+
+; Input: EAX = LBA Sector, EBX = Memory Buffer
+floppy_read_sector:
+    pusha
+    mov ecx, eax            ; Save LBA
+
+    ; Select Drive and LBA High
+    mov edx, 0x1F6
+    shr eax, 24
+    or al, 0xE0             ; Master drive, LBA mode
+    out dx, al
+
+    ; Sector count (1)
+    mov edx, 0x1F2
+    mov al, 1
+    out dx, al
+
+    ; LBA Low, Mid, High
+    mov eax, ecx
+    mov edx, 0x1F3
+    out dx, al
+    mov edx, 0x1F4
+    shr eax, 8
+    out dx, al
+    mov edx, 0x1F5
+    shr eax, 8
+    out dx, al
+
+    ; Command: Read with Retry
+    mov edx, 0x1F7
+    mov al, 0x20
+    out dx, al
+
+.wait:
+    in al, dx
+    test al, 1              ; Check ERR bit
+    jnz .error
+    test al, 8              ; Check DRQ bit (Ready to transfer)
+    jz .wait
+
+.read:
+    mov edx, 0x1F0
+    mov ecx, 256            ; Read 256 words (512 bytes)
+    mov edi, ebx
+    rep insw
+    popa
+    ret
+
+.error:
+    mov esi, msg_floppy_err
+    call api_print_string
+    popa
+    ret
+
+; Input: EAX = LBA Sector, EBX = Memory Buffer
+floppy_write_sector:
+    pusha
+    mov ecx, eax
+
+    mov edx, 0x1F6
+    shr eax, 24
+    or al, 0xE0
+    out dx, al
+
+    mov edx, 0x1F2
+    mov al, 1
+    out dx, al
+
+    mov eax, ecx
+    mov edx, 0x1F3
+    out dx, al
+    mov edx, 0x1F4
+    shr eax, 8
+    out dx, al
+    mov edx, 0x1F5
+    shr eax, 8
+    out dx, al
+
+    mov edx, 0x1F7
+    mov al, 0x30
+    out dx, al
+
+.wait:
+    in al, dx
+    test al, 0x80       ; ← también te faltaba BSY aquí
+    jnz .wait
+    test al, 1
+    jnz .error
+    test al, 8
+    jz .wait
+
+.write:
+    mov edx, 0x1F0
+    mov ecx, 256
+    mov esi, ebx
+    rep outsw           ; Enviamos los 512 bytes al disco
+    
+    ; --- NUEVO: Esperar a que el disco procese los datos ---
+    mov edx, 0x1F7
+.wait_write_finish:
+    in al, dx
+    test al, 0x80       ; Comprobar BSY (Busy)
+    jnz .wait_write_finish
+    
+    ; --- NUEVO: Comando Flush Cache (0xE7) y esperar ---
+    mov al, 0xE7
+    out dx, al
+.wait_flush:
+    in al, dx
+    test al, 0x80       ; Comprobar BSY de nuevo
+    jnz .wait_flush
+    
+    popa
+    ret
+
+.error:
+    mov esi, msg_floppy_err
+    call api_print_string
+    popa
+    ret
+%endif

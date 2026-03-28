@@ -1,0 +1,121 @@
+; ==================================================================
+; ac97.lasys - Driver básico AC'97 para LuisAlbertoOS
+; ==================================================================
+
+%ifndef AC97_LASYS
+%define AC97_LASYS
+
+PCI_CONFIG_ADDRESS equ 0x0CF8
+PCI_CONFIG_DATA    equ 0x0CFC
+
+ac97_nam_bar       dd 0  
+ac97_nabm_bar      dd 0  
+AC97_BDL_ADDR      equ 0x8000 ; Lista DMA segura lejos del FS y APP_POINTER
+
+msg_ac97_found     db 0x0A,"[OK] AC'97 Audio Detectado.",0
+msg_ac97_err       db 0x0A,"[WARN] AC'97 no encontrado en bus PCI.",0
+msg_playing        db 0x0A,"Reproduciendo audio WAV...",0
+
+ac97_init:
+    ; Buscar Intel 82801AA AC'97 en QEMU/VirtualBox
+    mov eax, 0x80001800 
+    mov dx, PCI_CONFIG_ADDRESS
+    out dx, eax
+    
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+    
+    cmp eax, 0x24158086
+    jne .not_found
+
+    mov esi, msg_ac97_found
+    call api_print_string
+
+    ; Leer BAR0 (NAM - Mezclador)
+    mov eax, 0x80001810
+    mov dx, PCI_CONFIG_ADDRESS
+    out dx, eax
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+    and eax, 0xFFFFFFFE 
+    mov [ac97_nam_bar], eax
+
+    ; Leer BAR1 (NABM - Bus Master DMA)
+    mov eax, 0x80001814
+    mov dx, PCI_CONFIG_ADDRESS
+    out dx, eax
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+    and eax, 0xFFFFFFFE
+    mov [ac97_nabm_bar], eax
+
+    ; Habilitar Bus Mastering
+    mov eax, 0x80001804
+    mov dx, PCI_CONFIG_ADDRESS
+    out dx, eax
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+    or eax, 0x05        
+    out dx, eax
+
+    ; Inicializar Códec
+    mov edx, [ac97_nam_bar]
+    mov ax, 0
+    out dx, ax ; Reset
+    call api_delay
+
+    add edx, 0x02
+    mov ax, 0x0000 
+    out dx, ax ; Volumen Maestro Max
+
+    mov edx, [ac97_nam_bar]
+    add edx, 0x18
+    mov ax, 0x0000
+    out dx, ax ; Volumen PCM Max
+
+    ret
+
+.not_found:
+    mov esi, msg_ac97_err
+    call api_print_string
+    ret
+
+; EBX = Puntero a datos (APP_POINTER + 44)
+; ECX = Tamaño en bytes
+ac97_play_wav:
+    mov edi, AC97_BDL_ADDR
+    mov [edi], ebx      ; Dirección física
+    
+    shr ecx, 1          ; Convertir bytes a samples (16-bit = 2 bytes)
+    cmp ecx, 0xFFFF
+    jle .size_ok
+    mov ecx, 0xFFFF     ; Limitar a 65535 samples (máximo por entrada BDL)
+.size_ok:
+    
+    mov ax, cx
+    mov word [edi+4], ax   ; Tamaño en samples
+    mov word [edi+6], 0x8000 ; Flag IOC (Interrupt on Completion)
+
+    ; Pasar BDL al controlador
+    mov edx, [ac97_nabm_bar]
+    add edx, 0x10       
+    mov eax, AC97_BDL_ADDR
+    out dx, eax
+
+    ; Configurar LVI a 0
+    mov edx, [ac97_nabm_bar]
+    add edx, 0x15       
+    mov al, 0
+    out dx, al
+
+    mov esi, msg_playing
+    call api_print_string
+
+    ; Iniciar DMA
+    mov edx, [ac97_nabm_bar]
+    add edx, 0x1B       
+    mov al, 0x01        
+    out dx, al
+
+    ret
+%endif

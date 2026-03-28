@@ -1,0 +1,205 @@
+; ------------------------------------------------------------------
+; fs.lasys - Minimal Flat Filesystem REAL
+; Directory LBA: 30. Máx 16 archivos
+; Entry: 16 bytes nombre, 4 bytes LBA, 4 bytes tamaño, 1 byte flags
+; ------------------------------------------------------------------
+
+%ifndef FS_LASYS
+%define FS_LASYS
+
+DIR_LBA     equ 30
+DATA_LBA    equ 31
+DIR_BUFFER  equ 0x5000  ; Directorio en memoria
+FILE_BUFFER equ 0x6000  ; Buffer I/O
+APP_POINTER equ 0x7000  ; Puntero a app cargada
+
+; FLAGS
+FLAG_FILE   equ 1
+FLAG_DIR    equ 2
+
+fs_init:
+    mov eax, DIR_LBA
+    mov ebx, DIR_BUFFER
+    call floppy_read_sector
+    ret
+
+fs_save_dir:
+    mov eax, DIR_LBA
+    mov ebx, DIR_BUFFER
+    call floppy_write_sector
+    ret
+
+fs_create_file:
+    mov edi, DIR_BUFFER
+    mov ecx, 16
+.find_empty:
+    cmp byte [edi],0
+    je .found
+    add edi,24
+    loop .find_empty
+    ret
+.found:
+    push edi
+    mov ecx,16
+.copy_name:
+    lodsb
+    cmp al,0
+    je .fill_zero
+    stosb
+    loop .copy_name
+.fill_zero:
+    mov al,0
+.fill_loop:
+    stosb
+    loop .fill_loop
+    pop edi
+    ; asignar sector
+    mov eax, edi
+    sub eax, DIR_BUFFER
+    mov ebx,24
+    xor edx,edx
+    div ebx
+    add eax, DATA_LBA
+    mov [edi+16], eax   ; LBA
+    mov dword [edi+20], 0 ; tamaño
+    mov byte [edi+24], al ; flag
+    call fs_save_dir
+    ret
+
+fs_read_file:
+    mov edi, DIR_BUFFER
+    mov ecx,16
+    xor eax,eax
+.find_file:
+    cmp byte [edi],0
+    je .next
+    push edi
+    push esi
+    mov edx,16
+.compare:
+    lodsb
+    cmp al,[edi]
+    jne .not_match
+    inc edi
+    loop .compare
+    pop esi
+    pop edi
+    ; encontrado
+    mov eax,[edi+16]      ; LBA
+    mov ecx,[edi+20]      ; [NUEVO] Extraer tamaño exacto en bytes
+    push ecx              ; [NUEVO] Proteger ECX por si el driver ATA lo borra
+    mov ebx, APP_POINTER
+    call floppy_read_sector
+    pop ecx               ; [NUEVO] Restaurar tamaño
+    ret
+.not_match:
+    pop esi
+    pop edi
+.next:
+    add edi,24
+    dec ecx
+    jnz .find_file
+    xor eax,eax
+    ret
+
+fs_write_file:
+    mov edi, DIR_BUFFER
+    mov edx,16
+.find_file_write:
+    cmp byte [edi],0
+    je .next
+    push edi
+    push esi
+    mov ecx,16
+.compare_write:
+    lodsb
+    cmp al,[edi]
+    jne .not_match
+    inc edi
+    loop .compare_write
+    pop esi
+    pop edi
+    ; encontrado
+    mov eax,[edi+16] ; LBA
+    call floppy_write_sector
+    mov [edi+20], ecx ; Guarda el tamaño
+    call fs_save_dir
+    ret
+.not_match:
+    pop esi
+    pop edi
+.next:
+    add edi,24
+    dec edx
+    jnz .find_file_write
+    ret
+
+fs_change_dir:
+    mov edi, DIR_BUFFER
+    mov ecx,16
+.find_dir:
+    cmp byte [edi],0
+    je .not_found
+    push edi
+    push esi
+    mov edx,16
+.compare_dir:
+    lodsb
+    cmp al,[edi]
+    jne .skip_compare
+    inc edi
+    loop .compare_dir
+    pop esi
+    pop edi
+    ; validar flag
+    cmp byte [edi+24], FLAG_DIR
+    jne .not_found
+    ; actualizar current_path
+    mov esi, [arg_ptr]      
+    cmp byte [esi],'.'
+    jne .append_dir
+    cmp byte [esi+1],'.'
+    jne .append_dir
+    mov edi, current_path
+.back_loop:
+    dec edi
+    cmp byte [edi],'/'
+    je .done_back
+    cmp edi, current_path
+    je .done_back
+    jmp .back_loop
+.done_back:
+    mov byte [edi+1],0
+    ret
+.append_dir:
+    mov edi, current_path
+.find_end:
+    cmp byte [edi],0
+    je .copy_dir
+    inc edi
+    jmp .find_end
+.copy_dir:
+    mov esi, [arg_ptr]
+.copy_loop:
+    lodsb
+    stosb
+    cmp al,0
+    je .add_slash
+    jmp .copy_loop
+.add_slash:
+    mov al,'/'
+    stosb
+    mov byte [edi],0
+    ret
+.skip_compare:
+    add edi,1
+    dec edx
+    jnz .compare_dir
+    pop esi
+    pop edi
+    add edi,24
+    dec ecx
+    jnz .find_dir
+.not_found:
+    ret
+%endif
