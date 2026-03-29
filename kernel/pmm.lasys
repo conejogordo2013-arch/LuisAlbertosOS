@@ -1,0 +1,177 @@
+; ------------------------------------------------------------------
+; pmm.lasys - Physical Memory Manager (bitmap de frames 4KiB)
+; ------------------------------------------------------------------
+
+%ifndef PMM_LASYS
+%define PMM_LASYS
+
+global pmm_init
+global pmm_alloc_frame
+global pmm_free_frame
+
+PMM_PAGE_SIZE      equ 4096
+PMM_MEM_LIMIT      equ 0x02000000            ; 32 MiB administrados
+PMM_MAX_FRAMES     equ PMM_MEM_LIMIT / PMM_PAGE_SIZE
+PMM_BITMAP_BYTES   equ PMM_MAX_FRAMES / 8
+
+PMM_LOW_RESERVED   equ 0x00200000            ; reservar 0..2MiB (kernel+boot)
+PMM_HEAP_START     equ 0x00100000            ; compatible con kmalloc heap
+PMM_HEAP_SIZE      equ 0x00020000            ; 128KiB
+
+pmm_init:
+    push eax
+    push ecx
+    push edi
+
+    ; Inicialmente: todo ocupado (1)
+    mov edi, pmm_bitmap
+    mov ecx, PMM_BITMAP_BYTES
+    mov al, 0xFF
+    rep stosb
+
+    ; Liberar rango utilizable principal
+    mov eax, PMM_LOW_RESERVED
+    mov ecx, PMM_MEM_LIMIT - PMM_LOW_RESERVED
+    call pmm_mark_range_free
+
+    ; Re-marcar heap del kernel como usado (evita colisión con kmalloc)
+    mov eax, PMM_HEAP_START
+    mov ecx, PMM_HEAP_SIZE
+    call pmm_mark_range_used
+
+    pop edi
+    pop ecx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; pmm_alloc_frame
+; Salida: EAX = dirección física frame (4KiB) o 0 si sin memoria
+; ------------------------------------------------------------
+pmm_alloc_frame:
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    xor esi, esi
+.scan:
+    cmp esi, PMM_MAX_FRAMES
+    jae .oom
+
+    mov ebx, esi
+    shr ebx, 3
+    mov al, [pmm_bitmap + ebx]
+    mov edx, esi
+    and edx, 7
+    bt eax, edx
+    jc .next               ; bit 1 => usado
+
+    ; marcar ocupado
+    bts eax, edx
+    mov [pmm_bitmap + ebx], al
+
+    mov eax, esi
+    shl eax, 12
+    jmp .done
+
+.next:
+    inc esi
+    jmp .scan
+
+.oom:
+    xor eax, eax
+
+.done:
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; pmm_free_frame
+; Entrada: EAX = dirección física (alineada a 4KiB)
+; ------------------------------------------------------------
+pmm_free_frame:
+    push ebx
+    push edx
+    mov edx, eax
+    shr edx, 12
+    cmp edx, PMM_MAX_FRAMES
+    jae .done
+    mov ebx, edx
+    shr ebx, 3
+    and edx, 7
+    mov al, [pmm_bitmap + ebx]
+    btr eax, edx
+    mov [pmm_bitmap + ebx], al
+.done:
+    pop edx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; Helpers de rango
+; Entrada:
+;   EAX = base física
+;   ECX = bytes
+; ------------------------------------------------------------
+pmm_mark_range_free:
+    push ebx
+    push edx
+    push esi
+    mov esi, eax
+    add ecx, PMM_PAGE_SIZE-1
+    shr ecx, 12
+.loop_free:
+    cmp ecx, 0
+    je .done
+    mov eax, esi
+    shr eax, 12
+    mov ebx, eax
+    shr ebx, 3
+    and eax, 7
+    mov dl, [pmm_bitmap + ebx]
+    btr edx, eax
+    mov [pmm_bitmap + ebx], dl
+    add esi, PMM_PAGE_SIZE
+    dec ecx
+    jmp .loop_free
+.done:
+    pop esi
+    pop edx
+    pop ebx
+    ret
+
+pmm_mark_range_used:
+    push ebx
+    push edx
+    push esi
+    mov esi, eax
+    add ecx, PMM_PAGE_SIZE-1
+    shr ecx, 12
+.loop_used:
+    cmp ecx, 0
+    je .done
+    mov eax, esi
+    shr eax, 12
+    mov ebx, eax
+    shr ebx, 3
+    and eax, 7
+    mov dl, [pmm_bitmap + ebx]
+    bts edx, eax
+    mov [pmm_bitmap + ebx], dl
+    add esi, PMM_PAGE_SIZE
+    dec ecx
+    jmp .loop_used
+.done:
+    pop esi
+    pop edx
+    pop ebx
+    ret
+
+pmm_bitmap:
+    times PMM_BITMAP_BYTES db 0
+
+%endif

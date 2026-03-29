@@ -1,5 +1,13 @@
 oskrnl_main:
     call api_clear_screen
+    call pmm_init
+    call paging_init
+    call heap_init
+    call acpi_init
+    call interrupts_init
+    call ahci_init
+    call net_init
+    call net_stack_init
     
     mov esi, welcome_msg
     call api_print_string

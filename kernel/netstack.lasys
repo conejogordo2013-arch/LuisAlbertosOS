@@ -1,0 +1,336 @@
+; ------------------------------------------------------------------
+; netstack.lasys - Minimal Ethernet + IPv4 + UDP (raw)
+; ------------------------------------------------------------------
+
+%ifndef NETSTACK_LASYS
+%define NETSTACK_LASYS
+
+global net_stack_init
+global net_poll
+global udp_send
+global net_local_mac
+global net_local_ip
+global udp_last_len
+global udp_last_src_ip
+global udp_last_src_port
+
+ETH_TYPE_IPV4 equ 0x0800
+IP_PROTO_UDP  equ 17
+
+NET_MTU       equ 1500
+ETH_HDR_LEN   equ 14
+IP_HDR_LEN    equ 20
+UDP_HDR_LEN   equ 8
+
+net_local_mac db 0x02,0x00,0x00,0x00,0x00,0x01
+net_local_ip  dd 0x6401A8C0           ; 192.168.1.100 (little-endian dword)
+
+udp_last_len      dw 0
+udp_last_src_ip   dd 0
+udp_last_src_port dw 0
+udp_last_payload  times NET_MTU db 0
+
+udp_tmp_dst_ip    dd 0
+udp_tmp_len       dd 0
+udp_tmp_src_port  dw 0
+udp_tmp_dst_port  dw 0
+
+net_rx_frame      times (ETH_HDR_LEN + NET_MTU) db 0
+net_tx_frame      times (ETH_HDR_LEN + NET_MTU) db 0
+
+net_stack_init:
+    mov word [udp_last_len], 0
+    mov dword [udp_last_src_ip], 0
+    mov word [udp_last_src_port], 0
+    ret
+
+; ------------------------------------------------------------
+; net_poll:
+; - lee un frame (si existe)
+; - procesa Ethernet/IPv4/UDP
+; ------------------------------------------------------------
+net_poll:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    mov edi, net_rx_frame
+    mov ecx, ETH_HDR_LEN + NET_MTU
+    call rtl8139_poll_receive
+    cmp eax, ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    jb .done
+
+    mov esi, net_rx_frame
+    ; Ethertype big-endian en bytes 12..13
+    mov al, [esi+12]
+    cmp al, 0x08
+    jne .done
+    mov al, [esi+13]
+    cmp al, 0x00
+    jne .done
+
+    add esi, ETH_HDR_LEN
+    mov ecx, eax
+    sub ecx, ETH_HDR_LEN
+    call ip_handle_packet
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; ip_handle_packet
+; Entrada:
+;   ESI = inicio IP header
+;   ECX = bytes IP
+; ------------------------------------------------------------
+ip_handle_packet:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    cmp ecx, IP_HDR_LEN + UDP_HDR_LEN
+    jb .done
+
+    mov al, [esi]
+    and al, 0xF0
+    cmp al, 0x40                 ; IPv4
+    jne .done
+
+    mov al, [esi+9]              ; protocol
+    cmp al, IP_PROTO_UDP
+    jne .done
+
+    ; dst ip debe ser local o broadcast 255.255.255.255
+    mov eax, [esi+16]
+    cmp eax, [net_local_ip]
+    je .route_udp
+    cmp eax, 0xFFFFFFFF
+    jne .done
+
+.route_udp:
+    ; IHL normalmente 20 bytes (sin opciones)
+    movzx ebx, byte [esi]
+    and ebx, 0x0F
+    shl ebx, 2
+    cmp ebx, IP_HDR_LEN
+    jb .done
+    cmp ecx, ebx
+    jbe .done
+    add esi, ebx
+    sub ecx, ebx
+    call udp_handle_packet
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; udp_handle_packet
+; Entrada:
+;   ESI = udp header
+;   ECX = bytes udp
+; ------------------------------------------------------------
+udp_handle_packet:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    cmp ecx, UDP_HDR_LEN
+    jb .done
+
+    ; src port
+    mov al, [esi]
+    mov ah, [esi+1]
+    xchg al, ah
+    mov [udp_last_src_port], ax
+
+    ; udp length (BE)
+    mov al, [esi+4]
+    mov ah, [esi+5]
+    xchg al, ah
+    mov bx, ax
+    cmp bx, UDP_HDR_LEN
+    jb .done
+    sub bx, UDP_HDR_LEN
+
+    mov [udp_last_len], bx
+    cmp bx, NET_MTU
+    jbe .len_ok
+    mov bx, NET_MTU
+    mov [udp_last_len], bx
+.len_ok:
+    add esi, UDP_HDR_LEN
+    mov edi, udp_last_payload
+    movzx ecx, bx
+    rep movsb
+
+    ; src ip (se asume frame actual en net_rx_frame)
+    mov eax, [net_rx_frame + ETH_HDR_LEN + 12]
+    mov [udp_last_src_ip], eax
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; udp_send
+; Entrada:
+;   ESI = payload ptr
+;   ECX = payload len
+;   EAX = dst ip (dword LE, e.g. 0x0101A8C0 = 192.168.1.1)
+;   DX  = src port (host order)
+;   BX  = dst port (host order)
+; Salida:
+;   EAX = 1 ok / 0 fail
+; ------------------------------------------------------------
+udp_send:
+    pushad
+
+    cmp ecx, NET_MTU - IP_HDR_LEN - UDP_HDR_LEN
+    ja .fail
+
+    mov [udp_tmp_dst_ip], eax
+    mov [udp_tmp_len], ecx
+    mov [udp_tmp_src_port], dx
+    mov [udp_tmp_dst_port], bx
+    mov ebp, esi                  ; payload source ptr
+
+    ; Ethernet header
+    mov edi, net_tx_frame
+    mov ecx, 6
+    mov al, 0xFF                  ; broadcast MAC por simplicidad
+    rep stosb
+    mov esi, net_local_mac
+    mov ecx, 6
+    rep movsb
+    mov byte [edi], 0x08
+    mov byte [edi+1], 0x00
+    add edi, 2
+
+    ; IPv4 header
+    mov byte [edi+0], 0x45        ; ver=4, ihl=5
+    mov byte [edi+1], 0x00        ; DSCP/ECN
+    ; total len = 20 + 8 + payload
+    mov eax, [udp_tmp_len]
+    add eax, IP_HDR_LEN + UDP_HDR_LEN
+    mov byte [edi+2], ah
+    mov byte [edi+3], al
+    mov byte [edi+4], 0
+    mov byte [edi+5], 1           ; identification
+    mov byte [edi+6], 0
+    mov byte [edi+7], 0
+    mov byte [edi+8], 64          ; TTL
+    mov byte [edi+9], IP_PROTO_UDP
+    mov byte [edi+10], 0
+    mov byte [edi+11], 0
+    mov eax, [net_local_ip]
+    mov [edi+12], eax
+    mov eax, [udp_tmp_dst_ip]
+    mov [edi+16], eax
+    ; checksum IP
+    push edi
+    call ip_checksum_20
+    pop edi
+    mov [edi+10], ax
+
+    add edi, IP_HDR_LEN
+
+    ; UDP header
+    ; src port
+    mov ax, [udp_tmp_src_port]
+    xchg al, ah
+    mov [edi+0], ax
+    ; dst port
+    mov ax, [udp_tmp_dst_port]
+    xchg al, ah
+    mov [edi+2], ax
+    ; len
+    mov eax, [udp_tmp_len]
+    add eax, UDP_HDR_LEN
+    mov byte [edi+4], ah
+    mov byte [edi+5], al
+    ; checksum (opcional en IPv4): 0
+    mov byte [edi+6], 0
+    mov byte [edi+7], 0
+    add edi, UDP_HDR_LEN
+
+    ; payload
+    mov esi, ebp
+    mov ecx, [udp_tmp_len]
+    rep movsb
+
+    ; enviar frame
+    mov esi, net_tx_frame
+    mov eax, [udp_tmp_len]
+    add eax, ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    mov ecx, eax
+    call rtl8139_send_packet
+    jmp .done
+
+.fail:
+    xor eax, eax
+
+.done:
+    mov [esp + 7*4], eax     ; devolver eax tras popad
+    popad
+    ret
+
+; ------------------------------------------------------------
+; ip_checksum_20
+; Entrada: EDI = header IPv4 de 20 bytes
+; Salida : AX checksum (network order)
+; ------------------------------------------------------------
+ip_checksum_20:
+    push ebx
+    push ecx
+    push edx
+
+    xor edx, edx
+    mov ecx, 10
+.sum:
+    mov bx, [edi]
+    add dx, bx
+    add edi, 2
+    dec ecx
+    jnz .sum
+
+    ; fold carry
+    mov bx, dx
+    shr edx, 16
+    add bx, dx
+    mov ax, bx
+    not ax
+    ; convertir a network byte order
+    xchg al, ah
+
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+%endif

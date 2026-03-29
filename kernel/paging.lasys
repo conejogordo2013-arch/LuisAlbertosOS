@@ -1,0 +1,115 @@
+; ------------------------------------------------------------------
+; paging.lasys - Paging básico (identity map + kernel region)
+; ------------------------------------------------------------------
+
+%ifndef PAGING_LASYS
+%define PAGING_LASYS
+
+global paging_init
+
+PAGE_PRESENT  equ 0x1
+PAGE_WRITABLE equ 0x2
+PAGE_FLAGS_RW equ PAGE_PRESENT | PAGE_WRITABLE
+
+PAGE_SIZE     equ 4096
+PT_ENTRIES    equ 1024
+
+; Mapeo inicial: 16 MiB identity map
+INIT_PDE_COUNT equ 4
+
+paging_init:
+    push eax
+    push ebx
+    push ecx
+    push edi
+
+    ; reservar frames físicos para PD y PTs
+    call pmm_alloc_frame
+    cmp eax, 0
+    je .done
+    mov [page_directory_ptr], eax
+
+    call pmm_alloc_frame
+    cmp eax, 0
+    je .done
+    mov [page_table0_ptr], eax
+
+    call pmm_alloc_frame
+    cmp eax, 0
+    je .done
+    mov [page_table1_ptr], eax
+
+    call pmm_alloc_frame
+    cmp eax, 0
+    je .done
+    mov [page_table2_ptr], eax
+
+    call pmm_alloc_frame
+    cmp eax, 0
+    je .done
+    mov [page_table3_ptr], eax
+
+    ; limpiar directorio
+    mov edi, [page_directory_ptr]
+    mov ecx, PT_ENTRIES
+    xor eax, eax
+    rep stosd
+
+    ; limpiar tablas
+    mov edi, [page_table0_ptr]
+    mov ecx, PT_ENTRIES * INIT_PDE_COUNT
+    xor eax, eax
+    rep stosd
+
+    ; rellenar page tables con identity map
+    mov edi, [page_table0_ptr]
+    mov ecx, PT_ENTRIES * INIT_PDE_COUNT
+    xor ebx, ebx
+.fill_pt:
+    mov eax, ebx
+    or eax, PAGE_FLAGS_RW
+    stosd
+    add ebx, PAGE_SIZE
+    loop .fill_pt
+
+    ; conectar PDE[0..3] -> PT0..PT3
+    mov eax, [page_table0_ptr]
+    or eax, PAGE_FLAGS_RW
+    mov edi, [page_directory_ptr]
+    mov [edi + 0*4], eax
+
+    mov eax, [page_table1_ptr]
+    or eax, PAGE_FLAGS_RW
+    mov [edi + 1*4], eax
+
+    mov eax, [page_table2_ptr]
+    or eax, PAGE_FLAGS_RW
+    mov [edi + 2*4], eax
+
+    mov eax, [page_table3_ptr]
+    or eax, PAGE_FLAGS_RW
+    mov [edi + 3*4], eax
+
+    ; cargar CR3 con page directory físico (identity)
+    mov eax, [page_directory_ptr]
+    mov cr3, eax
+
+    ; habilitar paging en CR0 (bit PG=31)
+    mov eax, cr0
+    or eax, 0x80000000
+    mov cr0, eax
+
+.done:
+    pop edi
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+page_directory_ptr dd 0
+page_table0_ptr    dd 0
+page_table1_ptr    dd 0
+page_table2_ptr    dd 0
+page_table3_ptr    dd 0
+
+%endif

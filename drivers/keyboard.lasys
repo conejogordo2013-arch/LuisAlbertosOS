@@ -2,36 +2,121 @@
 %define KEYBOARD_LASYS
 
 global kbd_read_char
+global kbd_irq_handler
 
 ; -----------------------------
 ; Estado
 ; -----------------------------
-ctrl_state db 0
-shift_state db 0
+ctrl_state      db 0
+shift_state     db 0
+e0_prefix_state db 0
 
 ; -----------------------------
-; Leer carácter (bloqueante)
-; Devuelve:
-;   AL = ASCII (0 si ignorar)
+; Buffer circular de entrada ASCII
+; -----------------------------
+KBD_BUF_SIZE equ 64
+kbd_buf       times KBD_BUF_SIZE db 0
+kbd_buf_head  db 0
+kbd_buf_tail  db 0
+kbd_buf_count db 0
+
+; -----------------------------
+; Leer carácter (bloqueante con buffer por IRQ)
+; Devuelve AL = ASCII (nunca 0)
 ; -----------------------------
 kbd_read_char:
+.wait_char:
+    call kbd_buf_pop
+    cmp al, 0
+    jne .done
+    sti
+    hlt
+    jmp .wait_char
+.done:
+    ret
 
-.wait:
+; -----------------------------
+; IRQ1 handler backend (teclado)
+; Lee scancode, traduce y encola ASCII
+; -----------------------------
+kbd_irq_handler:
+    push ebx
+    call kbd_hw_read_scancode
+    cmp al, 0
+    je .done
+    mov bl, al
+    call kbd_translate_scancode
+    cmp al, 0
+    je .done
+    call kbd_buf_push
+.done:
+    pop ebx
+    ret
+
+; -----------------------------
+; Poll de hardware (no bloqueante)
+; Lee todos los scancodes pendientes y
+; encola ASCII traducido en kbd_buf.
+; -----------------------------
+kbd_poll_input:
+    push ebx
+.poll_next:
+    call kbd_hw_read_scancode
+    cmp al, 0
+    je .poll_end
+
+    mov bl, al
+    call kbd_translate_scancode
+    cmp al, 0
+    je .poll_next
+
+    call kbd_buf_push
+    jmp .poll_next
+.poll_end:
+    pop ebx
+    ret
+
+; -----------------------------
+; Lee un scancode del controlador
+; Salida:
+;   AL = scancode, 0 si no hay datos
+; -----------------------------
+kbd_hw_read_scancode:
     in al, 0x64
     test al, 1
-    jz .wait
+    jz .no_data
 
     in al, 0x60
-    mov bl, al
+    ret
+.no_data:
+    xor al, al
+    ret
+
+; -----------------------------
+; Traducción scancode -> ASCII + estado
+; Entrada:
+;   BL = scancode
+; Salida:
+;   AL = ASCII (0 = ignorar/no imprimible)
+; -----------------------------
+kbd_translate_scancode:
+    xor al, al
+
+    ; Prefijo extendido (teclas E0)
+    cmp bl, 0xE0
+    jne .check_release
+    mov byte [e0_prefix_state], 1
+    ret
 
     ; -------------------------
     ; Detectar release (bit 7)
     ; -------------------------
+ .check_release:
     test bl, 0x80
     jnz .key_release
 
     ; -------------------------
-    ; CTRL
+    ; CTRL (izquierdo y derecho con prefijo E0)
     ; -------------------------
     cmp bl, 0x1D
     je .set_ctrl
@@ -115,18 +200,22 @@ kbd_read_char:
 ; -----------------------------
 .set_ctrl:
     mov byte [ctrl_state], 1
+    mov byte [e0_prefix_state], 0
     jmp .ignore
 
 .clr_ctrl:
     mov byte [ctrl_state], 0
+    mov byte [e0_prefix_state], 0
     jmp .ignore
 
 .set_shift:
     mov byte [shift_state], 1
+    mov byte [e0_prefix_state], 0
     jmp .ignore
 
 .clr_shift:
     mov byte [shift_state], 0
+    mov byte [e0_prefix_state], 0
     jmp .ignore
 
 ; -----------------------------
@@ -157,7 +246,80 @@ kbd_read_char:
     ret
 
 .ignore:
+    mov byte [e0_prefix_state], 0
     mov al, 0
+    ret
+
+; -----------------------------
+; kbd_buf_push
+; Entrada: AL = ASCII a encolar
+; -----------------------------
+kbd_buf_push:
+    push ebx
+    push edx
+    cmp al, 0
+    je .done
+
+    mov bl, [kbd_buf_count]
+    cmp bl, KBD_BUF_SIZE
+    jae .done               ; buffer lleno: descartar
+
+    mov bl, [kbd_buf_head]
+    movzx edx, bl
+    mov [kbd_buf + edx], al
+
+    inc bl
+    and bl, KBD_BUF_SIZE-1
+    mov [kbd_buf_head], bl
+
+    mov bl, [kbd_buf_count]
+    inc bl
+    mov [kbd_buf_count], bl
+.done:
+    pop edx
+    pop ebx
+    ret
+
+; -----------------------------
+; kbd_buf_pop
+; Salida: AL = ASCII o 0 si vacío
+; -----------------------------
+kbd_buf_pop:
+    push ebx
+    push edx
+    mov bl, [kbd_buf_count]
+    cmp bl, 0
+    je .empty
+
+    mov bl, [kbd_buf_tail]
+    movzx edx, bl
+    mov al, [kbd_buf + edx]
+
+    inc bl
+    and bl, KBD_BUF_SIZE-1
+    mov [kbd_buf_tail], bl
+
+    mov bl, [kbd_buf_count]
+    dec bl
+    mov [kbd_buf_count], bl
+    jmp .done
+.empty:
+    xor al, al
+.done:
+    pop edx
+    pop ebx
+    ret
+
+; -----------------------------
+; Espera ligera para evitar busy-spin agresivo
+; -----------------------------
+kbd_idle_wait:
+    push ecx
+    mov ecx, 256
+.spin:
+    pause
+    loop .spin
+    pop ecx
     ret
 
 ; -----------------------------
