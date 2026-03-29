@@ -1,0 +1,389 @@
+; ------------------------------------------------------------------
+; rtl8139.lasys - Driver básico RTL8139 (raw Ethernet)
+; - detección PCI
+; - init dispositivo
+; - envío/recepción de paquetes crudos
+; ------------------------------------------------------------------
+
+%ifndef RTL8139_LASYS
+%define RTL8139_LASYS
+
+global net_init
+global rtl8139_send_packet
+global rtl8139_poll_receive
+global rtl8139_found
+
+PCI_ADDR equ 0xCF8
+PCI_DATA equ 0xCFC
+
+RTL_VENDOR_ID equ 0x10EC
+RTL_DEVICE_ID equ 0x8139
+
+REG_IDR0      equ 0x00
+REG_TSD0      equ 0x10
+REG_TSAD0     equ 0x20
+REG_RBSTART   equ 0x30
+REG_CAPR      equ 0x38
+REG_IMR       equ 0x3C
+REG_ISR       equ 0x3E
+REG_TCR       equ 0x40
+REG_RCR       equ 0x44
+REG_CONFIG1   equ 0x52
+REG_CMD       equ 0x37
+
+CMD_RESET     equ 0x10
+CMD_RX_ENABLE equ 0x08
+CMD_TX_ENABLE equ 0x04
+
+ISR_ROK       equ 0x0001
+ISR_TOK       equ 0x0004
+
+RTL_RX_BUF_SIZE equ 8192
+RTL_TX_BUF_SIZE equ 2048
+
+rtl8139_found   db 0
+rtl8139_iobase  dw 0
+rtl_tx_index    db 0
+rtl_rx_offset   dw 0
+
+msg_rtl_found db "RTL8139 detected.",0x0A,0
+msg_rtl_init  db "RTL8139 initialized.",0x0A,0
+msg_rtl_none  db "RTL8139 not found.",0x0A,0
+
+; RX ring + 4 TX buffers
+align 16
+rtl_rx_buffer:
+    times (RTL_RX_BUF_SIZE + 16 + 1500) db 0
+align 16
+rtl_tx_buffer0: times RTL_TX_BUF_SIZE db 0
+rtl_tx_buffer1: times RTL_TX_BUF_SIZE db 0
+rtl_tx_buffer2: times RTL_TX_BUF_SIZE db 0
+rtl_tx_buffer3: times RTL_TX_BUF_SIZE db 0
+
+net_init:
+    mov byte [rtl8139_found], 0
+    call rtl8139_pci_detect
+    cmp byte [rtl8139_found], 1
+    jne .not_found
+    call rtl8139_hw_init
+    ret
+.not_found:
+    mov esi, msg_rtl_none
+    call api_print_string
+    ret
+
+; ------------------------------------------------------------
+; PCI detect (vendor/device match)
+; ------------------------------------------------------------
+rtl8139_pci_detect:
+    xor ecx, ecx                  ; bus
+.bus:
+    cmp ecx, 256
+    jae .done
+    xor edx, edx                  ; dev
+.dev:
+    cmp edx, 32
+    jae .next_bus
+    xor esi, esi                  ; fn
+.fn:
+    cmp esi, 8
+    jae .next_dev
+
+    ; vendor/device @ 0x00
+    mov eax, 0x80000000
+    mov ebx, ecx
+    shl ebx, 16
+    or eax, ebx
+    mov ebx, edx
+    shl ebx, 11
+    or eax, ebx
+    mov ebx, esi
+    shl ebx, 8
+    or eax, ebx
+    mov dx, PCI_ADDR
+    out dx, eax
+    mov dx, PCI_DATA
+    in eax, dx
+
+    cmp ax, RTL_VENDOR_ID
+    jne .next_fn
+    shr eax, 16
+    cmp ax, RTL_DEVICE_ID
+    jne .next_fn
+
+    ; BAR0 @ 0x10
+    mov eax, 0x80000010
+    mov ebx, ecx
+    shl ebx, 16
+    or eax, ebx
+    mov ebx, edx
+    shl ebx, 11
+    or eax, ebx
+    mov ebx, esi
+    shl ebx, 8
+    or eax, ebx
+    mov dx, PCI_ADDR
+    out dx, eax
+    mov dx, PCI_DATA
+    in eax, dx
+    and eax, 0xFFFFFFFC
+    mov [rtl8139_iobase], ax
+    mov byte [rtl8139_found], 1
+    mov esi, msg_rtl_found
+    call api_print_string
+    ret
+
+.next_fn:
+    inc esi
+    jmp .fn
+.next_dev:
+    inc edx
+    jmp .dev
+.next_bus:
+    inc ecx
+    jmp .bus
+.done:
+    ret
+
+; ------------------------------------------------------------
+; Init RTL8139 hardware básico
+; ------------------------------------------------------------
+rtl8139_hw_init:
+    push eax
+    push edx
+
+    mov dx, [rtl8139_iobase]
+    add dx, REG_CONFIG1
+    mov al, 0
+    out dx, al
+
+    ; reset
+    mov dx, [rtl8139_iobase]
+    add dx, REG_CMD
+    mov al, CMD_RESET
+    out dx, al
+.wait_reset:
+    in al, dx
+    test al, CMD_RESET
+    jnz .wait_reset
+
+    ; RX buffer base
+    mov edx, [rtl8139_iobase]
+    add dx, REG_RBSTART
+    mov eax, rtl_rx_buffer
+    out dx, eax
+
+    ; habilitar RX/TX
+    mov dx, [rtl8139_iobase]
+    add dx, REG_CMD
+    mov al, CMD_RX_ENABLE | CMD_TX_ENABLE
+    out dx, al
+
+    ; RX config (accept all + wrap)
+    mov dx, [rtl8139_iobase]
+    add dx, REG_RCR
+    mov eax, 0x0000E70F
+    out dx, eax
+
+    ; TX config default
+    mov dx, [rtl8139_iobase]
+    add dx, REG_TCR
+    mov eax, 0x03000700
+    out dx, eax
+
+    ; interrupts mask (ROK + TOK)
+    mov dx, [rtl8139_iobase]
+    add dx, REG_IMR
+    mov ax, ISR_ROK | ISR_TOK
+    out dx, ax
+
+    ; limpiar ISR
+    mov dx, [rtl8139_iobase]
+    add dx, REG_ISR
+    mov ax, 0xFFFF
+    out dx, ax
+
+    mov byte [rtl_tx_index], 0
+    mov word [rtl_rx_offset], 0
+
+    mov esi, msg_rtl_init
+    call api_print_string
+
+    pop edx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; rtl8139_send_packet
+; Entrada:
+;   ESI = ptr paquete
+;   ECX = longitud bytes (<= 2048 recomendado)
+; Salida:
+;   EAX = 1 ok, 0 fail
+; ------------------------------------------------------------
+rtl8139_send_packet:
+    push ebx
+    push edx
+    push edi
+
+    cmp byte [rtl8139_found], 1
+    jne .fail
+    cmp ecx, 0
+    je .fail
+    cmp ecx, RTL_TX_BUF_SIZE
+    ja .fail
+
+    mov bl, [rtl_tx_index]
+    xor edx, edx
+    mov dl, bl
+
+    ; seleccionar buffer TX N
+    cmp dl, 0
+    je .buf0
+    cmp dl, 1
+    je .buf1
+    cmp dl, 2
+    je .buf2
+    mov edi, rtl_tx_buffer3
+    jmp .copy
+.buf0:
+    mov edi, rtl_tx_buffer0
+    jmp .copy
+.buf1:
+    mov edi, rtl_tx_buffer1
+    jmp .copy
+.buf2:
+    mov edi, rtl_tx_buffer2
+
+.copy:
+    push ecx
+    rep movsb
+    pop ecx
+
+    ; TSADn
+    mov dx, [rtl8139_iobase]
+    add dx, REG_TSAD0
+    movzx eax, bl
+    shl eax, 2
+    add dx, ax
+    cmp bl, 0
+    je .tsad0
+    cmp bl, 1
+    je .tsad1
+    cmp bl, 2
+    je .tsad2
+    mov eax, rtl_tx_buffer3
+    jmp .tsad_out
+.tsad0:
+    mov eax, rtl_tx_buffer0
+    jmp .tsad_out
+.tsad1:
+    mov eax, rtl_tx_buffer1
+    jmp .tsad_out
+.tsad2:
+    mov eax, rtl_tx_buffer2
+.tsad_out:
+    out dx, eax
+
+    ; TSDn = longitud
+    mov dx, [rtl8139_iobase]
+    add dx, REG_TSD0
+    movzx eax, bl
+    shl eax, 2
+    add dx, ax
+    mov eax, ecx
+    out dx, eax
+
+    ; siguiente descriptor
+    inc bl
+    and bl, 0x03
+    mov [rtl_tx_index], bl
+
+    mov eax, 1
+    jmp .done
+
+.fail:
+    xor eax, eax
+.done:
+    pop edi
+    pop edx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; rtl8139_poll_receive
+; Entrada:
+;   EDI = buffer destino
+;   ECX = tamaño max destino
+; Salida:
+;   EAX = bytes copiados (0 si no hay paquete)
+; ------------------------------------------------------------
+rtl8139_poll_receive:
+    push ebx
+    push edx
+    push esi
+
+    xor eax, eax
+    cmp byte [rtl8139_found], 1
+    jne .done
+
+    ; chequear ROK
+    mov dx, [rtl8139_iobase]
+    add dx, REG_ISR
+    in ax, dx
+    test ax, ISR_ROK
+    jz .done
+
+    ; limpiar ROK en ISR
+    mov dx, [rtl8139_iobase]
+    add dx, REG_ISR
+    mov ax, ISR_ROK
+    out dx, ax
+
+    ; paquete en rx_buffer + offset
+    movzx ebx, word [rtl_rx_offset]
+    mov esi, rtl_rx_buffer
+    add esi, ebx
+
+    ; layout: [status:2][len:2][payload...]
+    mov dx, [esi]
+    test dx, 1                  ; ROK bit en status
+    jz .done
+
+    movzx eax, word [esi+2]     ; pkt len
+    cmp eax, 4
+    jb .done
+    sub eax, 4                  ; excluir CRC
+    cmp eax, ecx
+    jbe .copy_pkt
+    mov eax, ecx
+
+.copy_pkt:
+    add esi, 4
+    mov ecx, eax
+    rep movsb
+
+    ; avanzar offset RX (alineado dword)
+    movzx ebx, word [rtl_rx_offset]
+    movzx edx, word [rtl_rx_buffer + ebx + 2]
+    add ebx, edx
+    add ebx, 4
+    add ebx, 3
+    and ebx, 0xFFFFFFFC
+    and ebx, (RTL_RX_BUF_SIZE - 1)
+    mov [rtl_rx_offset], bx
+
+    ; CAPR debe apuntar 16 bytes detrás
+    mov dx, [rtl8139_iobase]
+    add dx, REG_CAPR
+    mov ax, bx
+    sub ax, 16
+    out dx, ax
+
+.done:
+    pop esi
+    pop edx
+    pop ebx
+    ret
+
+%endif

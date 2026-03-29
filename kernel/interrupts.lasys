@@ -1,0 +1,153 @@
+; ------------------------------------------------------------------
+; interrupts.lasys - IDT + PIC + IRQ mínimos
+; ------------------------------------------------------------------
+
+%ifndef INTERRUPTS_LASYS
+%define INTERRUPTS_LASYS
+
+global interrupts_init
+
+IDT_ENTRIES        equ 256
+IDT_ENTRY_SIZE     equ 8
+IDT_CODE_SELECTOR  equ 0x08
+IDT_INT_GATE       equ 0x8E
+
+PIC1_CMD  equ 0x20
+PIC1_DATA equ 0x21
+PIC2_CMD  equ 0xA0
+PIC2_DATA equ 0xA1
+PIC_EOI   equ 0x20
+
+interrupts_init:
+    call pic_remap
+    call idt_init
+    lidt [idtr]
+    sti
+    ret
+
+; ------------------------------------------------------------
+; PIC remap: IRQs -> INT 0x20..0x2F
+; Unmask: solo IRQ1 teclado
+; ------------------------------------------------------------
+pic_remap:
+    mov al, 0x11
+    out PIC1_CMD, al
+    out PIC2_CMD, al
+
+    mov al, 0x20
+    out PIC1_DATA, al
+    mov al, 0x28
+    out PIC2_DATA, al
+
+    mov al, 0x04
+    out PIC1_DATA, al
+    mov al, 0x02
+    out PIC2_DATA, al
+
+    mov al, 0x01
+    out PIC1_DATA, al
+    out PIC2_DATA, al
+
+    ; Master: habilitar sólo IRQ1 (11111101b)
+    mov al, 0xFD
+    out PIC1_DATA, al
+    ; Slave: deshabilitado completo
+    mov al, 0xFF
+    out PIC2_DATA, al
+    ret
+
+; ------------------------------------------------------------
+; IDT setup mínimo:
+; - Todos -> isr_default
+; - IRQ0 (0x20) -> irq0_stub
+; - IRQ1 (0x21) -> irq1_stub
+; ------------------------------------------------------------
+idt_init:
+    push eax
+    push ebx
+    push ecx
+    push edi
+
+    mov edi, idt_table
+    mov ecx, IDT_ENTRIES * IDT_ENTRY_SIZE / 4
+    xor eax, eax
+    rep stosd
+
+    mov ecx, 0
+.fill_defaults:
+    cmp ecx, IDT_ENTRIES
+    jae .set_irqs
+    mov ebx, isr_default
+    call idt_set_gate
+    inc ecx
+    jmp .fill_defaults
+
+.set_irqs:
+    mov ecx, 0x20
+    mov ebx, irq0_stub
+    call idt_set_gate
+
+    mov ecx, 0x21
+    mov ebx, irq1_stub
+    call idt_set_gate
+
+    pop edi
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; Entrada:
+;   ECX = índice vector
+;   EBX = handler address
+idt_set_gate:
+    push eax
+    push edx
+    push edi
+
+    mov edi, idt_table
+    mov eax, ecx
+    shl eax, 3
+    add edi, eax
+
+    mov eax, ebx
+    mov word [edi], ax
+    mov word [edi+2], IDT_CODE_SELECTOR
+    mov byte [edi+4], 0
+    mov byte [edi+5], IDT_INT_GATE
+    shr eax, 16
+    mov word [edi+6], ax
+
+    pop edi
+    pop edx
+    pop eax
+    ret
+
+isr_default:
+    pusha
+    popa
+    iretd
+
+irq0_stub:
+    pusha
+    mov al, PIC_EOI
+    out PIC1_CMD, al
+    popa
+    iretd
+
+irq1_stub:
+    pusha
+    call kbd_irq_handler
+    mov al, PIC_EOI
+    out PIC1_CMD, al
+    popa
+    iretd
+
+idtr:
+    dw IDT_ENTRIES * IDT_ENTRY_SIZE - 1
+    dd idt_table
+
+idt_table:
+    times IDT_ENTRIES * IDT_ENTRY_SIZE db 0
+
+%endif

@@ -1,0 +1,274 @@
+; ------------------------------------------------------------------
+; acpi.lasys - ACPI básico (solo lectura)
+; - Localizar RSDP
+; - Parsear RSDT
+; - Extraer datos base (FADT/MADT)
+; ------------------------------------------------------------------
+
+%ifndef ACPI_LASYS
+%define ACPI_LASYS
+
+global acpi_init
+global acpi_rsdp_ptr
+global acpi_rsdt_ptr
+global acpi_fadt_ptr
+global acpi_madt_ptr
+global acpi_lapic_addr
+global acpi_madt_flags
+global acpi_sci_int
+
+acpi_rsdp_ptr   dd 0
+acpi_rsdt_ptr   dd 0
+acpi_fadt_ptr   dd 0
+acpi_madt_ptr   dd 0
+acpi_lapic_addr dd 0
+acpi_madt_flags dd 0
+acpi_sci_int    dw 0
+
+msg_acpi_found  db "ACPI RSDP found.",0x0A,0
+msg_acpi_none   db "ACPI not found.",0x0A,0
+
+SIG_RSDT equ 0x54445352      ; "RSDT"
+SIG_FACP equ 0x50434146      ; "FACP"
+SIG_APIC equ 0x43495041      ; "APIC"
+
+acpi_init:
+    mov dword [acpi_rsdp_ptr], 0
+    mov dword [acpi_rsdt_ptr], 0
+    mov dword [acpi_fadt_ptr], 0
+    mov dword [acpi_madt_ptr], 0
+    mov dword [acpi_lapic_addr], 0
+    mov dword [acpi_madt_flags], 0
+    mov word  [acpi_sci_int], 0
+
+    call acpi_find_rsdp
+    cmp eax, 0
+    je .not_found
+    mov [acpi_rsdp_ptr], eax
+
+    mov esi, msg_acpi_found
+    call api_print_string
+
+    ; RSDP v1: RSDT address @ +16
+    mov ebx, [eax + 16]
+    mov [acpi_rsdt_ptr], ebx
+
+    call acpi_parse_rsdt
+    ret
+
+.not_found:
+    mov esi, msg_acpi_none
+    call api_print_string
+    ret
+
+; ------------------------------------------------------------
+; Buscar RSDP:
+; 1) EBDA primer KiB (alineado a 16)
+; 2) BIOS area 0xE0000..0xFFFFF (alineado a 16)
+; Salida: EAX = ptr o 0
+; ------------------------------------------------------------
+acpi_find_rsdp:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    ; EBDA segment pointer en 0x40E
+    xor eax, eax
+    mov ax, [0x040E]
+    shl eax, 4
+    cmp eax, 0
+    je .scan_bios
+
+    mov edi, eax
+    mov ecx, 1024/16
+.scan_ebda:
+    push ecx
+    mov esi, edi
+    call acpi_is_rsdp_here
+    cmp eax, 1
+    je .found
+    pop ecx
+    add edi, 16
+    loop .scan_ebda
+
+.scan_bios:
+    mov edi, 0x000E0000
+    mov ecx, (0x20000/16)
+.scan_hi:
+    push ecx
+    mov esi, edi
+    call acpi_is_rsdp_here
+    cmp eax, 1
+    je .found
+    pop ecx
+    add edi, 16
+    loop .scan_hi
+
+    xor eax, eax
+    jmp .done
+
+.found:
+    pop ecx
+    mov eax, edi
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; Verifica firma "RSD PTR " + checksum 20 bytes (ACPI 1.0)
+; Entrada: ESI = candidato
+; Salida:  EAX = 1 válido, 0 inválido
+; ------------------------------------------------------------
+acpi_is_rsdp_here:
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    cmp dword [esi], 0x20445352      ; "RSD "
+    jne .bad
+    cmp dword [esi+4], 0x20525450    ; "PTR "
+    jne .bad
+
+    mov ecx, 20
+    xor edx, edx
+.sum_loop:
+    mov bl, [esi]
+    add dl, bl
+    inc esi
+    dec ecx
+    jnz .sum_loop
+    cmp dl, 0
+    jne .bad
+
+    mov eax, 1
+    jmp .done
+.bad:
+    xor eax, eax
+.done:
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; Parsea RSDT y extrae tablas conocidas (FADT/MADT)
+; ------------------------------------------------------------
+acpi_parse_rsdt:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    mov edi, [acpi_rsdt_ptr]
+    cmp edi, 0
+    je .done
+
+    ; verificar firma RSDT
+    mov eax, [edi]
+    cmp eax, SIG_RSDT
+    jne .done
+
+    ; verificar checksum de tabla completa (length @ +4)
+    mov ecx, [edi + 4]
+    mov esi, edi
+    call acpi_checksum_ok
+    cmp eax, 1
+    jne .done
+
+    ; entries desde offset 36
+    mov eax, [edi + 4]
+    sub eax, 36
+    shr eax, 2                      ; cantidad de punteros
+    mov ecx, eax
+    lea esi, [edi + 36]
+
+.entry_loop:
+    cmp ecx, 0
+    je .done
+    mov ebx, [esi]
+    cmp ebx, 0
+    je .next_entry
+
+    ; firma de subtabla
+    mov eax, [ebx]
+    cmp eax, SIG_FACP
+    je .handle_fadt
+    cmp eax, SIG_APIC
+    je .handle_madt
+    jmp .next_entry
+
+.handle_fadt:
+    mov [acpi_fadt_ptr], ebx
+    ; FADT SCI_INT en offset 46 (u16, ACPI 1.0)
+    mov ax, [ebx + 46]
+    mov [acpi_sci_int], ax
+    jmp .next_entry
+
+.handle_madt:
+    mov [acpi_madt_ptr], ebx
+    ; MADT: Local APIC addr @ +36, flags @ +40
+    mov eax, [ebx + 36]
+    mov [acpi_lapic_addr], eax
+    mov eax, [ebx + 40]
+    mov [acpi_madt_flags], eax
+
+.next_entry:
+    add esi, 4
+    dec ecx
+    jmp .entry_loop
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; checksum ACPI tabla (suma bytes == 0)
+; Entrada: ESI = ptr, ECX = length
+; Salida:  EAX = 1 ok, 0 fail
+; ------------------------------------------------------------
+acpi_checksum_ok:
+    push ebx
+    push ecx
+    push edx
+    push esi
+
+    xor edx, edx
+.loop:
+    cmp ecx, 0
+    je .check
+    mov bl, [esi]
+    add dl, bl
+    inc esi
+    dec ecx
+    jmp .loop
+.check:
+    cmp dl, 0
+    jne .bad
+    mov eax, 1
+    jmp .done
+.bad:
+    xor eax, eax
+.done:
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+%endif

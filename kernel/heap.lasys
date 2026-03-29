@@ -1,0 +1,173 @@
+; ------------------------------------------------------------------
+; heap.lasys - Kernel heap simple (first-fit, sin paging)
+; Interfaz:
+;   heap_init          - inicializa heap
+;   kmalloc            - ECX = bytes solicitados, EAX = puntero o 0
+;   kfree              - EAX = puntero previamente asignado
+; ------------------------------------------------------------------
+
+%ifndef HEAP_LASYS
+%define HEAP_LASYS
+
+global heap_init
+global kmalloc
+global kfree
+
+HEAP_START       equ 0x00100000          ; 1 MiB
+HEAP_SIZE        equ 0x00020000          ; 128 KiB
+HEAP_END         equ HEAP_START + HEAP_SIZE
+HEAP_HDR_SIZE    equ 8                   ; size(dword) + used(dword)
+HEAP_MIN_SPLIT   equ HEAP_HDR_SIZE + 4   ; mínimo para crear bloque nuevo
+
+; ------------------------------------------------------------
+; Layout del bloque:
+;   [0..3]  size (bytes de payload)
+;   [4..7]  used (0 libre, 1 ocupado)
+;   [8..]   payload
+; ------------------------------------------------------------
+
+heap_init:
+    mov dword [HEAP_START], HEAP_SIZE - HEAP_HDR_SIZE
+    mov dword [HEAP_START + 4], 0
+    ret
+
+; ------------------------------------------------------------
+; kmalloc (first-fit)
+; Entrada: ECX = bytes
+; Salida : EAX = puntero payload, 0 si falla
+; ------------------------------------------------------------
+kmalloc:
+    push ebx
+    push edx
+    push esi
+    push edi
+
+    cmp ecx, 0
+    je .fail
+
+    ; Alineación a 4 bytes
+    add ecx, 3
+    and ecx, 0xFFFFFFFC
+
+    mov esi, HEAP_START
+.scan:
+    cmp esi, HEAP_END
+    jae .fail
+
+    mov ebx, [esi]        ; tamaño bloque
+    mov edx, [esi+4]      ; usado
+
+    cmp edx, 0
+    jne .next
+    cmp ebx, ecx
+    jb .next
+
+    ; candidato first-fit encontrado
+    mov edi, ebx
+    sub edi, ecx          ; remanente payload
+    cmp edi, HEAP_MIN_SPLIT
+    jb .no_split
+
+    ; split: bloque actual = solicitud, bloque siguiente = resto
+    mov eax, esi
+    add eax, HEAP_HDR_SIZE
+    add eax, ecx          ; cabecera del nuevo bloque
+
+    mov edx, edi
+    sub edx, HEAP_HDR_SIZE
+    mov [eax], edx
+    mov dword [eax+4], 0
+
+    mov [esi], ecx
+
+.no_split:
+    mov dword [esi+4], 1
+    mov eax, esi
+    add eax, HEAP_HDR_SIZE
+    jmp .done
+
+.next:
+    mov eax, [esi]
+    add eax, HEAP_HDR_SIZE
+    add esi, eax
+    jmp .scan
+
+.fail:
+    xor eax, eax
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; kfree
+; Entrada: EAX = puntero payload
+; ------------------------------------------------------------
+kfree:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    cmp eax, HEAP_START + HEAP_HDR_SIZE
+    jb .done
+    cmp eax, HEAP_END
+    jae .done
+
+    mov esi, eax
+    sub esi, HEAP_HDR_SIZE
+    mov dword [esi+4], 0
+
+    ; merge hacia adelante
+.merge_next:
+    mov ebx, [esi]
+    lea edi, [esi + HEAP_HDR_SIZE + ebx]
+    cmp edi, HEAP_END
+    jae .merge_prev
+    cmp dword [edi+4], 0
+    jne .merge_prev
+
+    ; size = size_actual + hdr + size_siguiente
+    mov edx, [edi]
+    add ebx, HEAP_HDR_SIZE
+    add ebx, edx
+    mov [esi], ebx
+    jmp .merge_next
+
+    ; merge con bloque previo (si existe y está libre)
+.merge_prev:
+    mov edi, HEAP_START
+.find_prev:
+    cmp edi, esi
+    jae .done
+    mov ebx, [edi]
+    lea ecx, [edi + HEAP_HDR_SIZE + ebx]
+    cmp ecx, esi
+    je .prev_found
+    mov edi, ecx
+    jmp .find_prev
+
+.prev_found:
+    cmp dword [edi+4], 0
+    jne .done
+    mov edx, [esi]
+    add ebx, HEAP_HDR_SIZE
+    add ebx, edx
+    mov [edi], ebx
+    ; intentar seguir fusionando hacia adelante desde el bloque previo
+    mov esi, edi
+    jmp .merge_next
+
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+%endif

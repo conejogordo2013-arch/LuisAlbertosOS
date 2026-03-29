@@ -1,0 +1,180 @@
+; ------------------------------------------------------------------
+; ahci.lasys - AHCI bootstrap parcial (detección + init básico HBA)
+; Mantiene compatibilidad: NO reemplaza ATA PIO existente.
+; ------------------------------------------------------------------
+
+%ifndef AHCI_LASYS
+%define AHCI_LASYS
+
+global ahci_init
+global ahci_available
+global ahci_abar
+
+PCI_CONFIG_ADDR equ 0xCF8
+PCI_CONFIG_DATA equ 0xCFC
+
+AHCI_CLASS_MASS_STORAGE equ 0x01
+AHCI_SUBCLASS_SATA      equ 0x06
+AHCI_PROGIF_AHCI        equ 0x01
+
+AHCI_GHC_OFF            equ 0x04
+AHCI_GHC_HR             equ 0x00000001
+AHCI_GHC_AE             equ 0x80000000
+
+AHCI_MMIO_MAX_MAPPED    equ 0x00FFFFFF   ; identity-map actual (16MiB)
+
+ahci_available db 0
+ahci_abar      dd 0
+
+msg_ahci_found db "AHCI controller detected.",0x0A,0
+msg_ahci_init  db "AHCI HBA basic init done.",0x0A,0
+msg_ahci_skip  db "AHCI ABAR outside mapped region, keeping ATA fallback.",0x0A,0
+msg_ahci_none  db "AHCI controller not found, using ATA PIO.",0x0A,0
+
+; ------------------------------------------------------------
+; ahci_init
+; - escanea PCI buscando class 01/06/01
+; - lee BAR5 (ABAR)
+; - inicializa GHC (AE + reset)
+; ------------------------------------------------------------
+ahci_init:
+    mov byte [ahci_available], 0
+    mov dword [ahci_abar], 0
+
+    xor ecx, ecx                  ; bus
+.bus_loop:
+    cmp ecx, 256
+    jae .not_found
+
+    xor edx, edx                  ; device
+.dev_loop:
+    cmp edx, 32
+    jae .next_bus
+
+    xor esi, esi                  ; function
+.fn_loop:
+    cmp esi, 8
+    jae .next_dev
+
+    ; leer class/subclass/progif (offset 0x08)
+    mov eax, 0x80000000
+    mov ebx, ecx
+    shl ebx, 16
+    or eax, ebx
+    mov ebx, edx
+    shl ebx, 11
+    or eax, ebx
+    mov ebx, esi
+    shl ebx, 8
+    or eax, ebx
+    or eax, 0x08
+    mov dx, PCI_CONFIG_ADDR
+    out dx, eax
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+
+    ; EAX[31:24]=class, [23:16]=subclass, [15:8]=progif
+    mov ebx, eax
+    shr ebx, 24
+    cmp bl, AHCI_CLASS_MASS_STORAGE
+    jne .next_fn
+
+    mov ebx, eax
+    shr ebx, 16
+    cmp bl, AHCI_SUBCLASS_SATA
+    jne .next_fn
+
+    mov ebx, eax
+    shr ebx, 8
+    cmp bl, AHCI_PROGIF_AHCI
+    jne .next_fn
+
+    ; leer BAR5 (ABAR) offset 0x24
+    mov eax, 0x80000000
+    mov ebx, ecx
+    shl ebx, 16
+    or eax, ebx
+    mov ebx, edx
+    shl ebx, 11
+    or eax, ebx
+    mov ebx, esi
+    shl ebx, 8
+    or eax, ebx
+    or eax, 0x24
+    mov dx, PCI_CONFIG_ADDR
+    out dx, eax
+    mov dx, PCI_CONFIG_DATA
+    in eax, dx
+    and eax, 0xFFFFFFF0
+    cmp eax, 0
+    je .next_fn
+
+    mov [ahci_abar], eax
+    mov esi, msg_ahci_found
+    call api_print_string
+
+    call ahci_hba_basic_init
+    ret
+
+.next_fn:
+    inc esi
+    jmp .fn_loop
+.next_dev:
+    inc edx
+    jmp .dev_loop
+.next_bus:
+    inc ecx
+    jmp .bus_loop
+
+.not_found:
+    mov esi, msg_ahci_none
+    call api_print_string
+    ret
+
+; ------------------------------------------------------------
+; AHCI HBA init mínimo (parcial):
+; - valida ABAR en rango mapeado
+; - habilita AHCI Enable (AE)
+; - solicita reset de HBA (HR) y espera limpieza
+; ------------------------------------------------------------
+ahci_hba_basic_init:
+    push eax
+    push ecx
+    push edi
+
+    mov edi, [ahci_abar]
+    cmp edi, AHCI_MMIO_MAX_MAPPED
+    ja .skip_mmio
+
+    mov eax, [edi + AHCI_GHC_OFF]
+    or eax, AHCI_GHC_AE
+    mov [edi + AHCI_GHC_OFF], eax
+
+    mov eax, [edi + AHCI_GHC_OFF]
+    or eax, AHCI_GHC_HR
+    mov [edi + AHCI_GHC_OFF], eax
+
+    mov ecx, 1000000
+.wait_reset:
+    mov eax, [edi + AHCI_GHC_OFF]
+    test eax, AHCI_GHC_HR
+    jz .ok
+    loop .wait_reset
+
+.ok:
+    mov byte [ahci_available], 1
+    mov esi, msg_ahci_init
+    call api_print_string
+    jmp .done
+
+.skip_mmio:
+    mov esi, msg_ahci_skip
+    call api_print_string
+
+.done:
+    pop edi
+    pop ecx
+    pop eax
+    ret
+
+%endif

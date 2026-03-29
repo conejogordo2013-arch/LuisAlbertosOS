@@ -1,7 +1,12 @@
 ; ------------------------------------------------------------------
 ; fs.lasys - Minimal Flat Filesystem REAL
 ; Directory LBA: 30. Máx 16 archivos
-; Entry: 16 bytes nombre, 4 bytes LBA, 4 bytes tamaño, 1 byte flags
+; Entry v2 (32 bytes):
+;   0..15  nombre
+;   16..19 start LBA
+;   20..23 tamaño en bytes
+;   24     flags
+;   28..31 cantidad de sectores
 ; ------------------------------------------------------------------
 
 %ifndef FS_LASYS
@@ -12,6 +17,19 @@ DATA_LBA    equ 31
 DIR_BUFFER  equ 0x5000  ; Directorio en memoria
 FILE_BUFFER equ 0x6000  ; Buffer I/O
 APP_POINTER equ 0x7000  ; Puntero a app cargada
+DISK_LAST_LBA equ 2879
+
+DIR_MAX_ENTRIES equ 16
+DIR_ENTRY_SIZE  equ 32
+DIR_NAME_LEN    equ 16
+DIR_LBA_OFF     equ 16
+DIR_SIZE_OFF    equ 20
+DIR_FLAG_OFF    equ 24
+DIR_SECT_OFF    equ 28
+
+; Legacy v1 layout (24 bytes stride + flag en +24)
+LEG_ENTRY_SIZE  equ 24
+LEG_FLAG_OFF    equ 24
 
 ; FLAGS
 FLAG_FILE   equ 1
@@ -21,6 +39,7 @@ fs_init:
     mov eax, DIR_LBA
     mov ebx, DIR_BUFFER
     call floppy_read_sector
+    call fs_maybe_upgrade_legacy_dir
     ret
 
 fs_save_dir:
@@ -30,17 +49,21 @@ fs_save_dir:
     ret
 
 fs_create_file:
+    push ebx
+    push eax
+    mov bl, al                     ; preservar flag solicitado
     mov edi, DIR_BUFFER
-    mov ecx, 16
+    mov ecx, DIR_MAX_ENTRIES
 .find_empty:
     cmp byte [edi],0
     je .found
-    add edi,24
+    add edi,DIR_ENTRY_SIZE
     loop .find_empty
+    pop eax
     ret
 .found:
     push edi
-    mov ecx,16
+    mov ecx,DIR_NAME_LEN
 .copy_name:
     lodsb
     cmp al,0
@@ -53,107 +76,156 @@ fs_create_file:
     stosb
     loop .fill_loop
     pop edi
-    ; asignar sector
-    mov eax, edi
-    sub eax, DIR_BUFFER
-    mov ebx,24
-    xor edx,edx
-    div ebx
-    add eax, DATA_LBA
-    mov [edi+16], eax   ; LBA
-    mov dword [edi+20], 0 ; tamaño
-    mov byte [edi+24], al ; flag
+    mov ecx, 1
+    call fs_find_free_extent
+    cmp eax, 0
+    je .no_space
+    mov [edi+DIR_LBA_OFF], eax
+    mov dword [edi+DIR_SIZE_OFF], 0
+    mov byte [edi+DIR_FLAG_OFF], bl
+    mov dword [edi+DIR_SECT_OFF], 1
     call fs_save_dir
+    pop eax
+    pop ebx
+    ret
+.no_space:
+    mov byte [edi], 0
+    pop eax
+    pop ebx
     ret
 
 fs_read_file:
+    push ebx
+    push edx
+    push esi
     mov edi, DIR_BUFFER
-    mov ecx,16
+    mov edx,DIR_MAX_ENTRIES
     xor eax,eax
 .find_file:
+    cmp edx, 0
+    je .not_found
     cmp byte [edi],0
     je .next
-    push edi
-    push esi
-    mov edx,16
-.compare:
-    lodsb
-    cmp al,[edi]
-    jne .not_match
-    inc edi
-    loop .compare
-    pop esi
-    pop edi
+    call fs_name_match
+    cmp eax, 0
+    jne .next
     ; encontrado
-    mov eax,[edi+16]      ; LBA
-    mov ecx,[edi+20]      ; [NUEVO] Extraer tamaño exacto en bytes
-    push ecx              ; [NUEVO] Proteger ECX por si el driver ATA lo borra
+    mov eax,[edi+DIR_LBA_OFF]
+    mov ecx,[edi+DIR_SIZE_OFF]
+    mov edx,[edi+DIR_SECT_OFF]
+    cmp edx, 0
+    jne .have_secs
+    mov edx, ecx
+    call fs_bytes_to_sectors_edx
+.have_secs:
     mov ebx, APP_POINTER
+.read_loop:
+    cmp edx, 0
+    je .done_ok
+    push eax
+    push edx
     call floppy_read_sector
-    pop ecx               ; [NUEVO] Restaurar tamaño
-    ret
-.not_match:
+    pop edx
+    pop eax
+    inc eax
+    add ebx, 512
+    dec edx
+    jmp .read_loop
+.done_ok:
+    mov eax,[edi+DIR_LBA_OFF]
+    mov ecx,[edi+DIR_SIZE_OFF]
     pop esi
-    pop edi
+    pop edx
+    pop ebx
+    ret
 .next:
-    add edi,24
-    dec ecx
+    add edi,DIR_ENTRY_SIZE
+    dec edx
     jnz .find_file
+.not_found:
     xor eax,eax
+    xor ecx,ecx
+    pop esi
+    pop edx
+    pop ebx
     ret
 
 fs_write_file:
+    push ebp
+    push edx
+    push esi
+    push ebx
+    mov ebp, ecx                  ; tamaño en bytes
     mov edi, DIR_BUFFER
-    mov edx,16
+    mov edx,DIR_MAX_ENTRIES
 .find_file_write:
+    cmp edx, 0
+    je .write_done
     cmp byte [edi],0
     je .next
-    push edi
-    push esi
-    mov ecx,16
-.compare_write:
-    lodsb
-    cmp al,[edi]
-    jne .not_match
-    inc edi
-    loop .compare_write
-    pop esi
-    pop edi
+    call fs_name_match
+    cmp eax, 0
+    jne .next
     ; encontrado
-    mov eax,[edi+16] ; LBA
+    mov ecx, ebp
+    mov edx, ecx
+    call fs_bytes_to_sectors_edx  ; EDX = sectores requeridos
+    cmp edx, [edi+DIR_SECT_OFF]
+    jbe .have_extent
+    mov ecx, edx
+    call fs_find_free_extent
+    cmp eax, 0
+    je .write_done
+    mov [edi+DIR_LBA_OFF], eax
+    mov [edi+DIR_SECT_OFF], edx
+.have_extent:
+    mov eax, [edi+DIR_LBA_OFF]
+    mov ecx, [edi+DIR_SECT_OFF]
+    mov edx, ebx
+.write_loop:
+    cmp ecx, 0
+    je .save_meta
+    push eax
+    push ecx
+    mov ebx, edx
     call floppy_write_sector
-    mov [edi+20], ecx ; Guarda el tamaño
+    pop ecx
+    pop eax
+    inc eax
+    add edx, 512
+    dec ecx
+    jmp .write_loop
+.save_meta:
+    mov [edi+DIR_SIZE_OFF], ebp
     call fs_save_dir
-    ret
-.not_match:
-    pop esi
-    pop edi
+    jmp .write_done
 .next:
-    add edi,24
+    add edi,DIR_ENTRY_SIZE
     dec edx
     jnz .find_file_write
+.write_done:
+    pop ebx
+    pop esi
+    pop edx
+    pop ebp
     ret
 
 fs_change_dir:
-    mov edi, DIR_BUFFER
-    mov ecx,16
-.find_dir:
-    cmp byte [edi],0
-    je .not_found
-    push edi
+    push edx
     push esi
-    mov edx,16
-.compare_dir:
-    lodsb
-    cmp al,[edi]
-    jne .skip_compare
-    inc edi
-    loop .compare_dir
-    pop esi
-    pop edi
+    mov edi, DIR_BUFFER
+    mov edx,DIR_MAX_ENTRIES
+.find_dir:
+    cmp edx, 0
+    je .not_found
+    cmp byte [edi],0
+    je .next_dir
+    call fs_name_match
+    cmp eax, 0
+    jne .next_dir
     ; validar flag
-    cmp byte [edi+24], FLAG_DIR
-    jne .not_found
+    cmp byte [edi+DIR_FLAG_OFF], FLAG_DIR
+    jne .next_dir
     ; actualizar current_path
     mov esi, [arg_ptr]      
     cmp byte [esi],'.'
@@ -170,6 +242,8 @@ fs_change_dir:
     jmp .back_loop
 .done_back:
     mov byte [edi+1],0
+    pop esi
+    pop edx
     ret
 .append_dir:
     mov edi, current_path
@@ -190,16 +264,247 @@ fs_change_dir:
     mov al,'/'
     stosb
     mov byte [edi],0
-    ret
-.skip_compare:
-    add edi,1
-    dec edx
-    jnz .compare_dir
     pop esi
-    pop edi
-    add edi,24
-    dec ecx
+    pop edx
+    ret
+.next_dir:
+    add edi,DIR_ENTRY_SIZE
+    dec edx
     jnz .find_dir
 .not_found:
+    pop esi
+    pop edx
+    ret
+
+; ------------------------------------------------------------
+; Compatibilidad: migra directorio legacy (24B/entry) a v2 32B.
+; Heurística: si el layout v2 parece válido, no tocar.
+; ------------------------------------------------------------
+fs_maybe_upgrade_legacy_dir:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    mov esi, DIR_BUFFER
+    mov ecx, DIR_MAX_ENTRIES
+    xor eax, eax                ; non-empty
+    xor edx, edx                ; valid flags
+.check_v2:
+    cmp byte [esi], 0
+    je .next_v2
+    inc eax
+    mov bl, [esi+DIR_FLAG_OFF]
+    cmp bl, FLAG_FILE
+    je .valid_v2
+    cmp bl, FLAG_DIR
+    jne .next_v2
+.valid_v2:
+    inc edx
+.next_v2:
+    add esi, DIR_ENTRY_SIZE
+    loop .check_v2
+    cmp eax, 0
+    je .done
+    cmp eax, edx
+    je .done                    ; ya parece v2
+
+    ; convertir legacy -> v2 usando FILE_BUFFER como temporal
+    mov edi, FILE_BUFFER
+    mov ecx, 512/4
+    xor eax, eax
+    rep stosd
+
+    mov ecx, DIR_MAX_ENTRIES
+    mov esi, DIR_BUFFER
+    mov edi, FILE_BUFFER
+.convert_loop:
+    cmp byte [esi], 0
+    je .next_legacy
+
+    push ecx
+    push esi
+    push edi
+
+    mov ebx, esi
+    mov edx, edi
+    mov ecx, DIR_NAME_LEN
+.cpy_name:
+    mov al, [ebx]
+    mov [edx], al
+    inc ebx
+    inc edx
+    dec ecx
+    jnz .cpy_name
+
+    mov eax, [esi+16]
+    mov [edi+DIR_LBA_OFF], eax
+    mov eax, [esi+20]
+    mov [edi+DIR_SIZE_OFF], eax
+    mov al, [esi+LEG_FLAG_OFF]
+    mov [edi+DIR_FLAG_OFF], al
+
+    mov edx, [esi+20]
+    call fs_bytes_to_sectors_edx
+    mov [edi+DIR_SECT_OFF], edx
+
+    pop edi
+    pop esi
+    pop ecx
+.next_legacy:
+    add esi, LEG_ENTRY_SIZE
+    add edi, DIR_ENTRY_SIZE
+    loop .convert_loop
+
+    mov esi, FILE_BUFFER
+    mov edi, DIR_BUFFER
+    mov ecx, 512/4
+    rep movsd
+    call fs_save_dir
+.done:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ------------------------------------------------------------
+; EDX(bytes) -> EDX(sectors), redondeo hacia arriba, mínimo 1
+; ------------------------------------------------------------
+fs_bytes_to_sectors_edx:
+    cmp edx, 0
+    jne .calc
+    mov edx, 1
+    ret
+.calc:
+    add edx, 511
+    shr edx, 9
+    cmp edx, 0
+    jne .done
+    mov edx, 1
+.done:
+    ret
+
+; ------------------------------------------------------------
+; Busca extensión libre contigua
+; Entrada: ECX = sectores requeridos
+; Salida:  EAX = LBA inicial (0 si no hay espacio)
+; ------------------------------------------------------------
+fs_find_free_extent:
+    push ebx
+    push edx
+    push esi
+    push edi
+    push ebp
+    mov eax, DATA_LBA
+
+.candidate_loop:
+    mov edi, DIR_BUFFER
+    mov ebp, DIR_MAX_ENTRIES
+    mov esi, eax                 ; candidato actual
+
+.scan_entries:
+    cmp ebp, 0
+    je .candidate_ok
+    cmp byte [edi], 0
+    je .next_entry
+    mov ebx, [edi+DIR_LBA_OFF]
+    cmp ebx, 0
+    je .next_entry
+    mov eax, [edi+DIR_SECT_OFF]
+    cmp eax, 0
+    jne .have_used_secs
+    mov eax, [edi+DIR_SIZE_OFF]
+    mov edx, eax
+    call fs_bytes_to_sectors_edx
+    mov eax, edx
+.have_used_secs:
+    ; [esi .. esi+ecx-1] vs [ebx .. ebx+eax-1]
+    mov edx, ebx
+    add edx, eax
+    dec edx                      ; used_end
+    mov eax, esi
+    add eax, ecx
+    dec eax                      ; cand_end
+
+    cmp eax, ebx
+    jb .next_entry_restore
+    cmp esi, edx
+    ja .next_entry_restore
+
+    ; overlap: mover candidato al final de este archivo + 1
+    mov esi, edx
+    inc esi
+    mov eax, esi
+    add eax, ecx
+    dec eax
+    cmp eax, DISK_LAST_LBA
+    ja .no_space
+    mov eax, esi
+    jmp .candidate_loop
+
+.next_entry_restore:
+    mov eax, esi
+.next_entry:
+    add edi, DIR_ENTRY_SIZE
+    dec ebp
+    jnz .scan_entries
+
+.candidate_ok:
+    ; candidato libre
+    mov eax, esi
+    add eax, ecx
+    dec eax
+    cmp eax, DISK_LAST_LBA
+    ja .no_space
+    mov eax, esi
+    jmp .done
+
+.no_space:
+    xor eax, eax
+.done:
+    pop ebp
+    pop edi
+    pop esi
+    pop edx
+    pop ebx
+    ret
+
+; ------------------------------------------------------------
+; Compara nombre de archivo con entrada (máx 16 bytes)
+; Entrada: ESI = nombre buscado, EDI = entrada
+; Salida : EAX = 0 match, 1 no match
+; ------------------------------------------------------------
+fs_name_match:
+    push ebx
+    push esi
+    push edi
+    push ecx
+    mov ecx, DIR_NAME_LEN
+.loop:
+    mov al, [esi]
+    mov bl, [edi]
+    cmp al, bl
+    jne .diff
+    cmp al, 0
+    je .same
+    inc esi
+    inc edi
+    dec ecx
+    jnz .loop
+.same:
+    xor eax, eax
+    jmp .ret
+.diff:
+    mov eax, 1
+.ret:
+    pop ecx
+    pop edi
+    pop esi
+    pop ebx
     ret
 %endif
