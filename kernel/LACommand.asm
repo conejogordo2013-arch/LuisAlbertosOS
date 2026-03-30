@@ -19,6 +19,10 @@ msg_newline       db 0x0A,0
 cmd_buffer        times 64 db 0
 arg_ptr           dd 0
 
+CMD_BUFFER_SIZE   equ 64
+CMD_MAX_LEN       equ CMD_BUFFER_SIZE-1
+EDITOR_BUF_SIZE   equ 512
+
 current_path      times 128 db 0
 path_root_init    db "C:/",0
 
@@ -34,6 +38,19 @@ cmd_edit      db "edit",0
 cmd_audio     db "audio",0
 cmd_img       db "img",0
 cmd_help       db "help",0
+
+; Tabla de despacho de comandos (nombre, handler)
+command_table:
+    dd cmd_dir,   do_dir
+    dd cmd_clear, do_clear
+    dd cmd_cd,    do_cd
+    dd cmd_mkdir, do_mkdir
+    dd cmd_touch, do_touch
+    dd cmd_edit,  do_edit
+    dd cmd_audio, do_audio
+    dd cmd_img,   do_img
+    dd cmd_help,  do_help
+    dd 0,         0
 
 ; Mensajes
 msg_err_cmd       db 0x0A,"Error: comando no reconocido.",0
@@ -92,7 +109,7 @@ read_key:
     cmp al, 0x08
     je handle_backspace
 
-    cmp ecx, 62
+    cmp ecx, CMD_MAX_LEN
     jge read_key
 
     mov [edi], al
@@ -109,74 +126,47 @@ handle_backspace:
     dec edi
     mov byte [edi], 0
     dec ecx
+    ; borrar visualmente el último carácter
+    mov al, 0x08
+    call print_char
+    mov al, ' '
+    call print_char
+    mov al, 0x08
+    call print_char
     jmp read_key
 
 parse_command:
     mov byte [edi], 0
     mov esi, cmd_buffer
+    call trim_left_spaces
     mov dword [arg_ptr], 0
-find_space:
+find_token_end:
     cmp byte [esi], 0
     je execute
     cmp byte [esi], ' '
-    je split
+    je split_command
     inc esi
-    jmp find_space
-split:
+    jmp find_token_end
+split_command:
     mov byte [esi], 0
     inc esi
+skip_arg_spaces:
+    cmp byte [esi], ' '
+    jne set_arg_ptr
+    inc esi
+    jmp skip_arg_spaces
+set_arg_ptr:
+    cmp byte [esi], 0
+    je execute
     mov dword [arg_ptr], esi
 
 execute:
     mov esi, cmd_buffer
     cmp byte [esi], 0
     je shell_loop
-
-    mov edi, cmd_dir
-    call strcmp
+    call dispatch_command
     cmp eax, 0
-    je do_dir
-
-    mov edi, cmd_clear
-    call strcmp
-    cmp eax, 0
-    je do_clear
-
-    mov edi, cmd_cd
-    call strcmp
-    cmp eax, 0
-    je do_cd
-
-    mov edi, cmd_mkdir
-    call strcmp
-    cmp eax, 0
-    je do_mkdir
-
-    mov edi, cmd_touch
-    call strcmp
-    cmp eax, 0
-    je do_touch
-
-    mov edi, cmd_edit
-    call strcmp
-    cmp eax, 0
-    je do_edit
-    
-    mov edi, cmd_audio
-    call strcmp
-    cmp eax, 0
-    je do_audio
-    
-    mov edi, cmd_img
-    call strcmp
-    cmp eax, 0
-    je do_img
-
-    mov edi, cmd_help
-    call strcmp
-    cmp eax, 0
-    je do_help
-
+    je shell_loop
     mov esi, msg_err_cmd
     call api_print_string
     jmp shell_loop
@@ -265,7 +255,7 @@ do_edit:
     call api_print_string
     
     mov edi, BUFFER_EDITOR
-    mov ecx, 512
+    mov ecx, EDITOR_BUF_SIZE
     mov al, 0
     rep stosb
 
@@ -288,7 +278,7 @@ do_edit:
     cmp al, 0x08         
     je .edit_backspace
 
-    cmp ecx, 511         
+    cmp ecx, EDITOR_BUF_SIZE-1
     jge .edit_loop
 
     mov [edi], al
@@ -312,7 +302,7 @@ do_edit:
     
     mov esi, [arg_ptr]     
     mov ebx, BUFFER_EDITOR 
-    mov ecx, 512           
+    mov ecx, EDITOR_BUF_SIZE
     call fs_write_file
 
     mov esi, msg_saved
@@ -349,6 +339,8 @@ do_audio:
 ; ==================================================================
 do_img:
     mov esi, [arg_ptr]
+    cmp esi, 0
+    je .no_arg
     cmp byte [esi], 0      ; Verificar si el argumento está vacío
     je .no_arg
 
@@ -439,4 +431,50 @@ strcmp:
     xor eax, eax
     pop edi
     pop esi
+    ret
+
+; ESI = puntero a buffer. Retorna ESI en primer no-espacio.
+trim_left_spaces:
+.loop:
+    cmp byte [esi], ' '
+    jne .done
+    inc esi
+    jmp .loop
+.done:
+    ret
+
+; Entrada: ESI = comando (cmd_buffer)
+; Salida: EAX = 0 encontrado / 1 no encontrado
+dispatch_command:
+    push ebx
+    push ecx
+    push edx
+
+    mov ebx, command_table
+.next:
+    mov edi, [ebx]
+    cmp edi, 0
+    je .not_found
+
+    call strcmp
+    cmp eax, 0
+    je .found
+
+    add ebx, 8
+    jmp .next
+
+.found:
+    mov eax, [ebx+4]
+    pop edx
+    pop ecx
+    pop ebx
+    call eax
+    xor eax, eax
+    ret
+
+.not_found:
+    mov eax, 1
+    pop edx
+    pop ecx
+    pop ebx
     ret
